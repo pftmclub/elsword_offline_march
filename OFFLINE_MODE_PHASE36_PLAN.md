@@ -1,0 +1,1552 @@
+# Offline Elsword — phases 36-45: "box" items, end to end
+
+`ISSUES_2.md` #7:
+
+> i need you to cover all "box" item (the item that need to be opened)
+> functionality because right now i feel like it's half baked. dont make
+> assumption and refer on how the real server behaviour does (i can access the
+> real live database data when you need something)
+
+Plus a priority the user set while this document was being written: **the
+Philosopher's Scroll first**, then everything else.
+
+**Written 2026-09-08, from the tree and from the shipped client scripts.** Every
+line reference below was read while writing; check them rather than
+re-deriving them. Where a claim came from decrypting a `.lua` out of the game
+directory, the recipe is in §0.9 so you can reproduce it.
+
+Four decisions taken with the user, 2026-09-08:
+
+- **Scope is all four families**: openable containers, the hand-in/trade tables
+  (`ITEM_EXCHANGE`, `ITEM_CONVERT`), the end-of-dungeon treasure box, and the
+  item workshop (`ITEM_MANUFACTURE`).
+- **Sealed cubes match live, with the unseal path landing first** — phase 39
+  before phase 40. §0.6 explains why this ordering turned out to be load-bearing
+  for a different reason than the one it was chosen for.
+- **Item 60004276 is refused offline, not transcribed.** It is a real live-server
+  bug (§0.2); reproducing it would consume a player's item for nothing, and the
+  standing rule that an item consumed for nothing is unrecoverable outranks
+  "transcribe, don't tidy" here. Phase 36 owns it.
+- This document **supersedes step 4 of phase 34** in
+  `OFFLINE_MODE_PHASE29_PLAN.md`, which folded "cover all box item function" in
+  as an audit. See §0.8.
+
+---
+
+## §0 — Read this before any phase in this batch
+
+Nine findings. Each one would otherwise cost a phase conversation an hour, and
+three of them contradict the obvious assumption.
+
+### 0.1 "Box" is not one system — it is three routes, and the client picks
+
+This is the single most important fact in the document. `CX2UIInventory`'s
+right-click path decides which packet a "box" produces, and it checks
+`GetCanUseInventory()` **first**
+([X2UIInventory.cpp:5917](X2Lib/X2UIInventory.cpp#L5917)):
+
+| route | condition | packet | offline status |
+|---|---|---|---|
+| **A** | `GetItemTemplet()->GetCanUseInventory() == true` | `EGS_USE_ITEM_IN_INVENTORY_REQ` — the `default:` arm at [`:6896`](X2Lib/X2UIInventory.cpp#L6896) of a ~120-case switch | **consumed, delivers nothing** unless it is a skill-unseal book or the skill note |
+| **B** | else, and the item is in the client's random-item registry (`IsRandomItem`, [`:6929`](X2Lib/X2UIInventory.cpp#L6929)) | `EGS_OPEN_RANDOM_ITEM_REQ` | **works** — phase 20 built it properly |
+| **C** | else | nothing is sent; the click is dead | n/a |
+
+So the boxes that feel half baked are **route A**, not the cube path everyone
+assumes. That one fact explains both halves of the complaint:
+
+- `ISSUES_2.md` #6 ("opening a box empties my ED") is
+  `kAck.m_iED = 0` at [Handlers_Inventory.cpp:202](X2Lib/Offline/Handlers_Inventory.cpp#L202),
+  never reassigned on any path including success at `:308-314`. The client
+  *assigns* that field over the character's ED
+  ([X2UIInventory.cpp:8919](X2Lib/X2UIInventory.cpp#L8919)).
+- "half baked" is the same handler calling `ConsumeOne` and then doing nothing
+  ([Handlers_Inventory.cpp:304-314](X2Lib/Offline/Handlers_Inventory.cpp#L304)).
+
+The cube handler by contrast fills ED on **every** reply, refusals included
+([Handlers_Social.cpp:2637](X2Lib/Offline/Handlers_Social.cpp#L2637)) — copy
+that shape, not the other one.
+
+**Before writing code for any item, establish which route it takes.** §0.9 is
+how.
+
+### 0.2 The live item-use handler is at `GSUserInventory.cpp:3944`. The copy at `:4940` is a trap
+
+`SERV_UPGRADE_SKILL_SYSTEM_2013` is defined
+([ServerDefine.h:3749](KncWX2Server/Common/ServerDefine.h#L3749)), so the live
+pair is:
+
+- `IMPL_ON_FUNC( EGS_USE_ITEM_IN_INVENTORY_REQ )` — **`:3944`**, the validation switch
+- `IMPL_ON_FUNC( DBE_USE_ITEM_IN_INVENTORY_ACK )` — **`:4535`**, the effect switch
+
+The second pair at `:4940` / `:5931` is inside the `#else` **and** wrapped in
+`/* … */` (opened at `:4939`, closed at `:6737`). It is dead twice over.
+
+The two copies are *not* identical, which is what makes this dangerous rather
+than merely wasteful. `EL_CHAR_LEVEL_UP_ITEM2` (60004276) has a case in the dead
+effect switch at `:6066` and **no case** in the live one at `:4655` — so on the
+live US server that item passes validation, is consumed, and does nothing.
+
+**Rule for this batch: quote `:3944` and `:4535`. If a line number you are about
+to cite is above 4938, you are reading dead code.**
+
+### 0.3 `SERV_*` flag states that matter here
+
+Checked, not assumed:
+
+| flag | state | where |
+|---|---|---|
+| `SERV_UPGRADE_SKILL_SYSTEM_2013` | **on** | `ServerDefine.h:3749` |
+| `SERV_CHAR_LEVEL_UP_ITEM` | **on** | `ServerDefine.h:1285` |
+| `SERV_CHAR_LEVEL_UP_ITEM_EVENT_RENA` | **on** (global) | `ServerDefine_Global.h:559` |
+| `SERV_SEALED_RANDOM_ITEM` | **on** | `ServerDefine.h:391` |
+| `SERV_CUBE_OPEN_ED_CONDITION` | **on** | `ServerDefine.h:3412` |
+| `SERV_CUBE_IN_ITEM_MAPPING` | **on** | `ServerDefine.h:94` |
+| `SERV_NEW_ITEM_SYSTEM_2013_05` | **on** | `ServerDefine.h:3709` |
+| `SERV_USE_ITEM_DB_UPDATE_FIX` | **on** | `ServerDefine.h:1405` |
+| `SERV_LIMIT_LEVEL_NOT_USE_ITEM_MSG` | **off** — JP only | `ServerDefine_JP.h:225` |
+| `SERV_DUNGEON_CLEAR_PAYMENT_ITEM_EVENT` | **off** | not defined anywhere |
+| `SERV_TREASURE_BOX_ITEM` | **off** | not defined anywhere |
+| `SERV_OPEN_CUBE_REALTIME_DB_UPDATE` | **off** | not defined anywhere |
+
+Two consequences worth carrying: the US refusal code for a max-level scroll is
+`NetError::ERR_UNKNOWN`, not `ERR_NOT_USE_01`; and `CheckCharLevelUp()` takes no
+argument in this build.
+
+### 0.4 Nothing in this batch is blocked on packing a file
+
+Unusual for this project, and worth stating because the reflex is to stop and
+ask. The game directory has a loose `data036/` beside the `.kom`s (187 files),
+`MASS_FILE_FIRST` resolves it, and every table these phases need is already
+there. All decrypt with the key in §0.9:
+
+| file | Lua entry point | what it is |
+|---|---|---|
+| `RandomItem.lua` | `g_pItemManager:AddRandomItemTemplet( id, keyID, keyCount, requiredED )` | the **client's** cube registry — this is what decides route B ([X2ItemManager.cpp:1592](X2Lib/X2ItemManager.cpp#L1592)) |
+| `RandomItemTable.lua` (7.9 MB) | `g_pRandomItemManager:AddRandomItemTemplet` / `AddRandomItemGroup` | cube **contents** and odds; already loaded by `CX2OfflineRandomItem` |
+| `RandomItemData.lua` | `AddSealRandomItemInfo`, `AddNotifyResultItemInfo`, `AddCharmItem`, `AddAttractionItemInfo` | seal / announce / charm presentation |
+| `ItemConvertTable.lua` | `g_pItemManager:AddItemConvertInfo` / `AddItemConvertGroup` — fields `m_ConvertType`, `m_TargetItemID`, `m_ResultItemID`, `m_Commission` | phase 42 |
+| `ItemExchangeTable.lua` | `g_pItemManager:AddItemExchangeData` — fields include `m_iSourceQuantity`, `m_iServerGroupID` | phase 41 |
+| `ManufactureItem.lua` | the workshop recipes (`CX2ItemManager::ManufactureData`, [X2ItemManager.h:69](X2Lib/X2ItemManager.h#L69)) | phase 44 |
+| `PackageItemData.lua` | `g_pCashItemManager:AddPackageItemData` | cash-package contents |
+| `AddCubePackageData.lua` | `g_pCX2CubePackageManager:AddCubePackageData` | cube-package grouping |
+| `CubeOpenImageInfo.lua` | `g_pCubeOpenImageManager:AddImageInfo_LUA` | the cube-open animation |
+| `ItemTrans.lua` | flat `id, name, desc` constant run | ~43,577 item id → live US English name |
+
+`CX2OfflineRandomItem::RunScript` ([X2OfflineRandomItem.cpp:68-95](X2Lib/Offline/X2OfflineRandomItem.cpp#L68))
+is the loader shape to copy: `LoadDataFile` → `DoMemory` → `DoMemoryNotEncript`
+fallback that logs, and a degrade-if-missing path.
+
+### 0.5 The offline item row already has every column these phases need
+
+`KOfflineItemRow` ([X2OfflineDB.h:50-66](X2Lib/Offline/X2OfflineDB.h#L50))
+carries `m_iSealData`, `m_iItemState`, `m_iPeriod`, `m_iUsageType`,
+`m_iEnchantLevel`, three attribs and both socket vectors.
+
+**No phase in this batch needs a schema migration.** If you find yourself
+writing one, stop and re-read this section — `X2OfflineDB` migrates forward
+only, and a migration written by mistake is not reversible.
+
+### 0.6 `m_ucSealData` is one byte holding two different things — and `IS_SEALED` is dead
+
+The obvious reading of "sealed cube" is `CXSLItem::ITEM_STATE::IS_SEALED`. That
+is wrong, and following it wastes a phase.
+
+`IS_SEALED` is **declared and never referenced** — one hit in the entire tree,
+its own definition at [XSLItem.h:55](KncWX2Server/Common/X2Data/XSLItem.h#L55).
+Zero uses in `KncWX2Server/`, zero in `X2Lib/`. Likewise
+`KInventory::Seal` / `Unseal` ([Inventory.cpp:3772](KncWX2Server/GameServer/Inventory.cpp#L3772),
+`:3789`) are called from nowhere but each other's declaration.
+
+The real mechanism is `KItemInfo::m_ucSealData`
+([CommonPacket.h:481](KncWX2Server/Common/CommonPacket.h#L481)), a single
+`unsigned char` encoding two facts at once
+([CommonPacket.h:556-563](KncWX2Server/Common/CommonPacket.h#L556)):
+
+```cpp
+bool IsSealedItem() const { return ( m_ucSealData >= 100 ); }  // >=100 means bound
+void UnsealItem()         { m_ucSealData -= 100; }             // unsealing subtracts 100
+unsigned char GetSealCount() const                             // the low part is the stamp count
+{
+    if( m_ucSealData >= 100 )
+        return ( m_ucSealData - 100 );
+    …
+}
+```
+
+So: **the hundreds digit is "bound", the remainder is the Phoru-stamp count.**
+A cube seals its output by setting `m_ucSealData = 100`
+([GSGameDBThread.cpp:3381](KncWX2Server/GameServer/GSGameDBThread.cpp#L3381)),
+i.e. "bound, zero stamps".
+
+Two consequences:
+
+1. **A cube-sealed item really is stranded until it is unsealed.** So the
+   39-before-40 ordering the user chose is not merely tidy, it is required —
+   phase 40 without phase 39 creates unusable player items.
+2. `Query_UpdateSealItem` **skips any item with a period**
+   ([GSGameDBThread.cpp:3377](KncWX2Server/GameServer/GSGameDBThread.cpp#L3377)):
+   `if( mit->second.m_sPeriod > 0 ) continue;`. Rental items out of a cube are
+   never sealed. Phases 39 and 40 interact here; neither may ignore it.
+
+The client side agrees: `m_ucTimesToBeSealed = data.m_kItemInfo.GetSealCount()`
+([X2Item.h:627](X2Lib/X2Item.h#L627)) and the inventory UI gates on
+`GetMaxSealCount() - m_ucTimesToBeSealed`
+([X2UIInventory.cpp:7932](X2Lib/X2UIInventory.cpp#L7932), `:8027`).
+
+### 0.7 What is and is not implemented offline today
+
+| event | offline | note |
+|---|---|---|
+| `EGS_OPEN_RANDOM_ITEM_REQ` | handled ([Handlers_Social.cpp:2616](X2Lib/Offline/Handlers_Social.cpp#L2616)) | route B; fidelity gaps in phase 40 |
+| `EGS_USE_ITEM_IN_INVENTORY_REQ` | handled but nearly empty ([Handlers_Inventory.cpp:190](X2Lib/Offline/Handlers_Inventory.cpp#L190)) | route A; phases 36 and 37 |
+| `EGS_GET_PURCHASED_PACKAGE_CASH_ITEM_REQ` | handled (`Handlers_Shop.cpp`) | cash packages |
+| `EGS_SEAL_ITEM_REQ` / `EGS_UNSEAL_ITEM_REQ` | **IGNORED** ([X2OfflineIgnore.cpp:63-64](X2Lib/Offline/X2OfflineIgnore.cpp#L63)) | phase 39 |
+| `EGS_ITEM_EXCHANGE_REQ` | **IGNORED** (`:68`) | phase 41 |
+| `EGS_ITEM_CONVERT_REQ` | **IGNORED** (`:67`) | phase 42 |
+| `EGS_ITEM_MANUFACTURE_REQ` | **IGNORED** (`:60`) | phase 44 |
+| `EGS_SYNTHESIS_ITEM_REQ`, `EGS_SYNTHESIS_SOCKET_GROUPID_REQ` | **neither handled nor ignored** → logs `*** UNHANDLED ***` | phase 45 |
+| `EGS_START_REWARD_BOX_SELECT_*` / `EGS_SELECT_REWARD_BOX_*` | stubs ([Handlers_Room.cpp:3228-3249](X2Lib/Offline/Handlers_Room.cpp#L3228)) | phase 43 — **and the live server has no handler either**, see that phase |
+
+**One stale ignore entry to clean — done in phase 37.** `EGS_RESOLVE_ITEM_REQ`
+sat in the ignore list *and* was dispatched to a real handler
+(`Handlers_Inventory.cpp:2236`). Dispatch wins, so behaviour was right and the
+list was lying — and an ignore rule is a promise that nothing is silently
+dropped. The line is gone. The four beside it (`EGS_IDENTIFY_ITEM_REQ`,
+`EGS_ITEM_EVALUATE_REQ`, `EGS_RESTORE_ITEM_REQ`,
+`EGS_RESTORE_ITEM_EVALUATE_REQ`) were checked and are genuinely unhandled —
+leave those alone.
+
+### 0.8 Overlap with `OFFLINE_MODE_PHASE29_PLAN.md`
+
+Phase 34 there owns `ISSUES_2.md` #5 (the zeroed ED) and folds
+"cover all box item function" in as its **step 4, an audit**. That step is
+superseded by this document; correct it to say so when phase 34 runs.
+
+Phases 34, 35 and 36 all edit `Handler_EGS_USE_ITEM_IN_INVENTORY_REQ`. Because
+the scroll is the user's priority, and because a level-up cannot be verified
+while the same reply is zeroing the wallet, **phase 36 absorbs phase 34's ED fix
+for that one handler** (the `FillAckED` helper). Phase 34 then keeps only
+`EGS_RESOLVE_ITEM_REQ` and `EGS_ATTRIB_ENCHANT_ITEM_REQ`, and phase 35 (fetch
+aura) should run after 36 to avoid a conflict.
+
+### 0.9 Naming an item, and finding its route
+
+Every phase here starts by identifying a real item. Do not pattern-match on
+names, and do not use `ScriptData/ItemTemplet.xlsx` — it is a stale KR snapshot
+that disagrees with what shipped (`CLAUDE.md`, the live-DB rule).
+
+The scripts in the game directory's `data036/` are Lua 5.1 bytecode
+XOR-encrypted with a repeating 12-byte key:
+
+```
+02 AA F8 C6 DC AB 47 26 EF BB 00 98
+```
+
+XOR the whole file with `key[i % 12]` and you get plain `luac` output starting
+`\x1bLuaQ`. A crude constant-pool scan (type byte `3` = 8-byte double, type byte
+`4` = `u32` length-including-NUL then bytes) is enough:
+
+- **`ItemTrans.lua`** — a flat `TNUMBER id, TSTRING name, TSTRING desc` run,
+  ~43,577 entries. This is how "the Philosopher's Scroll" became `160267`.
+- **`RandomItem.lua`** — if the item's ID is **not** among its constants, the
+  item is not a cube and cannot take route B. Its only two string constants are
+  `AddRandomItemTemplet` and `g_pItemManager`, so a numeric hit is meaningful.
+- **`Item.lua`** (34 MB) — the strings around an item's ID constant give its
+  icon and its `BFI_BUFF_*` / special-ability names.
+
+When code reading cannot settle a question, add a temporary diagnostic rather
+than reasoning further: `CX2OfflineLog::Server( L"..." )` is flushed per line and
+available anywhere in `X2Lib`. Gate it behind a short-lived
+`SERV_IRUHADEV_*_DEBUG` flag, tag the lines with a grep-able prefix, and remove
+it before the phase closes. For this batch the highest-value diagnostic is one
+line in `Handler_EGS_USE_ITEM_IN_INVENTORY_REQ` printing the item ID,
+`GetItemType()`, `GetCanUseInventory()`, `GetNumSpecialAbility()` and
+`GetNumBuffFactorPtr()` — it settles §0.1's route question for any item in one
+play-test.
+
+---
+
+## §1 — Shared preamble
+
+`OFFLINE_MODE_PHASE9_PLAN.md`'s §1 applies unchanged. One line opens a phase:
+
+> Read §0 and the Phase N section of `OFFLINE_MODE_PHASE36_PLAN.md`, plus §1 of
+> `OFFLINE_MODE_PHASE9_PLAN.md`, then do Phase N. Don't read the other phase
+> sections.
+
+The standing facts, in short:
+
+1. Branch is `mods/offline-mod-2`. Everything in this batch is **client-only** —
+   nothing touches `KncWX2Server/`, so the servers never need rebuilding.
+2. **Every edit is gated by `SERV_IRUHADEV_OFFLINE`**, the flag already in
+   `KTDXLIB/Always.h`. Do not mint a per-phase flag; the phase-9 doc's §1 rule 2
+   explains why the four that were minted had to be migrated away. A throwaway
+   `SERV_IRUHADEV_*_DEBUG` logging flag is the only exception.
+3. Build and deploy:
+   ```sh
+   TRUNK="f:/elsword stuff/elsword_2014/els_2014/ElswordFiles/ready_and_built/ProjectX2_SVN/ProjectX2_SVN/source/EU_CN_US/Trunk"
+   DATA="F:/elsword stuff/elsword_2014/els_2014/237311/22191271/data"
+   touch X2Lib/stdafx.cpp        # after ANY header edit, or the PCH eats it
+   msbuild X2Lib/X2Lib_2010.vcxproj -p:Configuration=US_SERVICE -p:Platform=Win32 "-p:SolutionDir=$TRUNK/"
+   msbuild X2/X2_2010.vcxproj       -p:Configuration=US_SERVICE -p:Platform=Win32 "-p:SolutionDir=$TRUNK/"
+   ls -la X2/US_SERVICE/X2.exe   # judge by the artifact; post-build ALWAYS fails here
+   cp X2/US_SERVICE/X2.exe "$DATA/X2_offline.exe"
+   ```
+   Verify the copy landed by reading the name, size and mtime programmatically.
+   The directory holds eight other `X2*.exe`.
+4. Reading the logs is the verification; there is no test suite.
+5. `els_db.sql` is real player data, and `X2OfflineDB` migrates forward only.
+   Per §0.5, no phase here should need a migration at all.
+
+**Files in this batch that carry non-ASCII bytes**: the offline
+`Handlers_*.cpp` and `X2Offline*.{h,cpp}` are ASCII, but `X2UIInventory.cpp`,
+`X2ItemManager.cpp` and `X2StateDungeonResult.cpp` are **CP949** and phases 43
+and 45 may touch them. `CLAUDE.md`'s rule binds: after editing any file with
+non-ASCII bytes, run `file <path>` and `git diff --stat`, and if a ten-line
+change came out as hundreds of lines, restore and redo it as a byte-level Python
+patch. This has already destroyed a file twice in this project.
+
+### Cross-cutting rules — every phase obeys all five
+
+1. **Never consume an item for nothing.** The refusal shape is already in the
+   handler ([Handlers_Inventory.cpp:215-223](X2Lib/Offline/Handlers_Inventory.cpp#L215)):
+   reply an error, leave the item, log the ID and why. A refusal is a bug
+   report; a consumed item is unrecoverable player data.
+2. **Fill `m_iED` on the initial error value**, the way the cube handler does at
+   `Handlers_Social.cpp:2637` — that is what makes it impossible for a later
+   `return Reply(...)` to ship a zero.
+3. **Name the item before writing code for it** (§0.9), and establish its route
+   (§0.1).
+4. **Read the live handler, not the commented one** (§0.2).
+5. **Fresh out-vector per `InsertItem` call.** `InsertItem` clears the caller's
+   vector on entry ([X2OfflineInventory.cpp:1436](X2Lib/Offline/X2OfflineInventory.cpp#L1436));
+   the reference shape is [Handlers_Social.cpp:2838-2847](X2Lib/Offline/Handlers_Social.cpp#L2838).
+
+### Live-DB asks
+
+Per `CLAUDE.md`'s live-DB rule these are asks with a named query, never
+assumptions. **None of them blocks phase 36.** Ask as plain text in the
+conversation, never as a file written into the game tree, and keep server names,
+linked servers and logins out of anything committed or logged.
+
+```sql
+SELECT OBJECT_NAME(object_id) AS proc_name, definition
+FROM   sys.sql_modules
+WHERE  OBJECT_NAME(object_id) IN ( 'gup_insert_item', 'gup_update_item_seal',
+                                   'gup_get_item_list_seal' );
+
+-- when the live names may have drifted from this snapshot's
+SELECT name FROM sys.procedures WHERE name LIKE 'gup_%item%' ORDER BY name;
+```
+
+| proc | wanted by | question it answers |
+|---|---|---|
+| `gup_insert_item` | phase 40 | which columns a cube-inserted row is actually born with — period, enchant, seal |
+| `gup_update_item_seal` | phases 39, 40 | confirms `m_ucSealData = 100` is stored verbatim |
+| `gup_get_item_list_seal` | phase 39 | how seal state is read back at login |
+| `gup_%item_exchange%`, `gup_%convert%`, `gup_%manufacture%` | phases 41, 42, 44 | the names first; bodies once known |
+
+---
+
+## §2 — Phase index
+
+| Phase | Subject | Size | Confidence | Blocked? |
+|---|---|---|---|---|
+| **36** | **Philosopher's Scroll (160267): instant level-up**, + the ED fix for this handler | small | **CONFIRMED** | no |
+| **37** | Route A: the item-use effect switch, transcribed from `GSUserInventory.cpp:3979`/`:4556` | large | **DONE 2026-09-08** (cash skill points split out — see its verdict) | no |
+| **38** | Cube coverage: client registry vs. contents table, and the refusal census | investigation | **DONE 2026-09-08, play-tested** — two non-empty differences, 18 cubes each, both live-faithful; log lines clarified, nothing fabricated | no |
+| **39** | `EGS_UNSEAL_ITEM_REQ` / `EGS_SEAL_ITEM_REQ` | medium | CONFIRMED | no |
+| **40** | Cube fidelity: rental period, and the seal phase 39 made safe | medium | CONFIRMED | no |
+| **41** | `EGS_ITEM_EXCHANGE_REQ` | medium | CONFIRMED | no |
+| **42** | `EGS_ITEM_CONVERT_REQ` | medium | CONFIRMED | no |
+| **43** | Dungeon reward box — **confirm it is dead on live, then decide** | small | CONFIRMED | no |
+| **44** | `EGS_ITEM_MANUFACTURE_REQ`: the item workshop | medium | CONFIRMED | no |
+| **45** | `EGS_SYNTHESIS_ITEM_REQ` + drive the `UNHANDLED` bucket back to empty | small | CONFIRMED | no |
+
+Ordering that matters:
+
+- **36 first.** The user's stated priority, and self-contained.
+- **39 strictly before 40.** Phase 40 seals cube output; without 39 that output
+  is unusable (§0.6).
+- **38 informs 37 and 40** but blocks neither. It is investigation; it can run
+  alongside 37 provided they do not both edit `Handlers_Inventory.cpp`.
+- **36, 37 and phase-34/35 of the other document all edit the same handler.**
+  Do not run them as parallel conversations.
+- 41, 42, 44, 45 are independent of everything and of each other.
+
+---
+
+# Phase 36 — Philosopher's Scroll (160267): instant level-up
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+### Symptom
+The Philosopher's Scroll is right-clicked in the inventory. Offline it is
+consumed and nothing happens, and the displayed ED drops to zero. The item is
+gone.
+
+### Diagnosis — CONFIRMED
+
+**The item.** `ItemTrans.lua` (decrypted per §0.9) gives:
+
+> **160267** — "Philosopher's Scroll" — *"A super rare scroll that will
+> instantly grant one level up increase from your current level.
+> (Right-click to use)"*
+
+The server names it `CXSLItem::EI_CHAR_LEVEL_UP_ITEM = 160267`
+([XSLItem.h:713](KncWX2Server/Common/X2Data/XSLItem.h#L713)),
+behind `SERV_CHAR_LEVEL_UP_ITEM`, which is on (§0.3).
+
+**Its route is A, not B** (§0.1), established two ways rather than assumed:
+160267 is absent from the client's `RandomItem.lua` registry, and it has no
+`case` of its own in `X2UIInventory.cpp`'s switch — it falls through to
+`default:` at [`:6894`](X2Lib/X2UIInventory.cpp#L6894), which sends
+`EGS_USE_ITEM_IN_INVENTORY_REQ`. The client only reaches that switch at all when
+`GetCanUseInventory()` is true, so the templet flag must be true or the live game
+could never have used the item either.
+
+**The live behaviour is two switch arms.**
+
+Validation, [GSUserInventory.cpp:4162-4180](KncWX2Server/GameServer/GSUserInventory.cpp#L4162):
+
+```cpp
+case CXSLItem::EI_CHAR_LEVEL_UP_ITEM:
+case CXSLItem::EL_CHAR_LEVEL_UP_ITEM2:          // SERV_CHAR_LEVEL_UP_ITEM_EVENT_RENA, on
+    {
+        if( SiKGameSysVal()->GetLimitsLevel() == GetLevel() )
+        {
+            KEGS_USE_ITEM_IN_INVENTORY_ACK kPacket;
+            kPacket.m_iOK = NetError::ERR_UNKNOWN;   // US: SERV_LIMIT_LEVEL_NOT_USE_ITEM_MSG is JP-only
+            SendPacket( EGS_USE_ITEM_IN_INVENTORY_ACK, kPacket );
+            return;
+        }
+    }
+    break;
+```
+
+Effect, [GSUserInventory.cpp:4655-4671](KncWX2Server/GameServer/GSUserInventory.cpp#L4655):
+
+```cpp
+case CXSLItem::EI_CHAR_LEVEL_UP_ITEM:            // note: 60004276 is NOT here, see below
+    {
+        const int iNextLevel = GetLevel() + 1;
+        const int iTotalExpByNextLevel = SiKExpTable()->GetRequireTotalExpbyLevel( iNextLevel );
+        m_kEXP.AddExp( iTotalExpByNextLevel - GetEXP() );
+        CheckCharLevelUp();                       // no-arg; SERV_DUNGEON_CLEAR_PAYMENT_ITEM_EVENT is off
+    }
+    break;
+```
+
+So the scroll does not grant a flat amount of EXP — it tops the character up to
+**exactly** the total required for the next level. A character at 40% of the way
+through level 30 ends at 0% of level 31, not 40%.
+
+**The ED.** `kAck.m_iED = 0` at
+[Handlers_Inventory.cpp:202](X2Lib/Offline/Handlers_Inventory.cpp#L202) and is
+never reassigned. The real server sources it from `GetED()`
+(`GSUserInventory.cpp:4544`). This is why the phase owns the ED fix: the exit
+test cannot distinguish "level-up worked" from "everything is broken" while the
+wallet is being zeroed on the same packet.
+
+**Everything needed already exists offline.** Reuse, do not rewrite:
+
+| need | existing code |
+|---|---|
+| exp → level, skill-point award, persist | `CX2OfflineServer::ApplyDungeonReward` ([Handlers_Room.cpp:2711](X2Lib/Offline/Handlers_Room.cpp#L2711)) |
+| the EXP table | `g_pData->GetEXPTable()->GetEXPData( n ).m_nTotalExp` ([Handlers_Room.cpp:2740](X2Lib/Offline/Handlers_Room.cpp#L2740)) — the client's own table, so the two cannot disagree |
+| `EGS_CHAR_LEVEL_UP_NOT` + both stat blocks | `CX2OfflineServer::PushLevelUp` ([X2OfflineServer.cpp:976](X2Lib/Offline/X2OfflineServer.cpp#L976)) |
+| level-up quest and title steps | `CX2OfflineServer::QuestOnLevelUp` ([Handlers_Quest.cpp:1023](X2Lib/Offline/Handlers_Quest.cpp#L1023)) |
+| the level cap | `_CONST_X2GAME_::g_iMaxLevel` = **67** for US ([Always_US.h:75](KTDXLIB/OnlyGlobal/Always_US.h#L75)) |
+
+On the cap: the server uses `SiKGameSysVal()->GetLimitsLevel()`, read from
+`GameSysValTable.lua`. `g_iMaxLevel` is a legitimate stand-in rather than a
+guess — the studio's own comment beside the `#define` says the constant and
+`GameSysValTable.lua`'s `MAXLevel` must be changed together, and
+`ApplyDungeonReward` already caps against it (`Handlers_Room.cpp:2737`). Cite
+that comment where you use it.
+
+**Item 60004276.** `EL_CHAR_LEVEL_UP_ITEM2` appears in the live *validation*
+switch (`:4164`) but not in the live *effect* switch (`:4655`) — its only effect
+case is at `:6066`, inside the commented-out `#else` (§0.2). On the live US
+server it is validated, consumed, and does nothing. **Offline refuses it**, per
+the user's decision; see step 4.
+
+### What to do
+
+1. **Add the ED fix first**, so the rest is verifiable. Set `kAck.m_iED` from the
+   loaded unit row on the **initial error value**, replacing the `= 0` at
+   `Handlers_Inventory.cpp:202`, exactly as `Handlers_Social.cpp:2637` does. If
+   you add the `FillAckED` helper that phase 34 proposes, note in the commit that
+   phase 34's scope shrinks accordingly (§0.8).
+2. **Add the max-level refusal**, before anything is consumed:
+   refuse when `kUnitRow.m_iLevel >= (int)_CONST_X2GAME_::g_iMaxLevel` with
+   `NetError::ERR_UNKNOWN`, leaving the item in the bag, and log the level. Put
+   it beside the existing pre-consume refusals at `Handlers_Inventory.cpp:238-302`
+   so it shares their shape.
+3. **Add the effect**, after `ConsumeOne` succeeds. Transcribe `:4655`:
+   ```
+   iNextLevelTotalExp = GetEXPTable()->GetEXPData( level + 1 ).m_nTotalExp
+   iAddEXP            = iNextLevelTotalExp - kUnitRow.m_iEXP
+   ApplyDungeonReward( unitUID, iAddEXP, 0, &iOldLevel )
+   ```
+   then `PushLevelUp` and `QuestOnLevelUp` **only if the level actually rose**,
+   copying the guard at [Handlers_Room.cpp:2880-2884](X2Lib/Offline/Handlers_Room.cpp#L2880).
+   `ApplyDungeonReward` already awards the skill points and saves; do not
+   duplicate either.
+4. **Refuse 60004276** with the item intact and a log line naming the studio
+   source — that `GSUserInventory.cpp:4655` has no case for it and `:6066`
+   does but is inside the commented-out `#else`. This is a deliberate divergence
+   from live and the log line is what makes it reconstructable later.
+5. Add a `//{{ Iruha : 2026-09-08 // …` change block around the new code, per the
+   house convention.
+
+### Trap
+
+- **`ApplyDungeonReward`'s name.** It is not dungeon-specific — it is the only
+  exp/ED/level/SP path offline has, and `Handler_EGS_END_GAME_REQ` is merely its
+  first caller. Reusing it is right. Writing a second level-up path beside it is
+  how the client and the save start disagreeing about what level the character
+  is.
+- **Do not add a flat EXP amount.** `GetRequireTotalExpbyLevel` returns a
+  *total*, and the server subtracts the current EXP from it. Adding
+  `GetRequireNeedExpbyLevel` instead would over-pay a character mid-level and
+  could grant two levels.
+- **`ApplyDungeonReward` caps EXP at the max level** (`Handlers_Room.cpp:2747`),
+  so a scroll used at 66 lands on 67 cleanly — but only step 2's refusal stops
+  a scroll being eaten at 67 for nothing.
+- The `m_iTempCode` field on the ACK is the pet-auto-looting echo
+  (`Handlers_Inventory.cpp:203`); leave it alone.
+
+### Exit test
+
+Note level, EXP and ED. Then, on a character below 67:
+
+- Right-click the Philosopher's Scroll. The character gains **exactly one**
+  level; the level-up effect plays; skill points rise by the curve's amount; the
+  displayed ED is **unchanged** and equals `select ed from unit`.
+- `offline_server.log` carries the `REWARD unitUID=… LEVEL UP n -> n+1` line and
+  a `+n SP` line.
+- `select level, exp from unit` shows the EXP sitting exactly on the new level's
+  `m_nTotalExp`, not above it.
+
+Then take a character to 67 and confirm the scroll is refused **with the item
+still in the bag** and a log line saying why. Same for 60004276 at any level.
+
+### As built — 2026-09-08
+
+Play-tested: the scroll levels the character, the data persists and the level-up
+effect plays. Four notes for whoever reads this next:
+
+- **`EGS_CHAR_LEVEL_UP_NOT` alone does not update any number in a village**, and
+  this plan assumed it did. `CX2TFieldGame::Handler_EGS_CHAR_LEVEL_UP_NOT`
+  ([X2TFieldGame.cpp:4210](X2Lib/X2TFieldGame.cpp#L4210)) is one line for the
+  local player — `SetIsLevelUp( true )` — so the effect played while the
+  top-left gauge, the level text and the SP count stayed on the old figures
+  until the character was reselected. The copy that *does* update them
+  ([X2StateMenu.cpp:4526](X2Lib/X2StateMenu.cpp#L4526)) works off
+  `g_pX2Game->GetUserUnitByUID` and returns early when `g_pX2Game` is NULL,
+  which it is in a village: `CX2TFieldGame` is not a `CX2Game`.
+
+  Live has the same gap and fills it by sending the whole `KUnitInfo` first —
+  [GSUserFunction.cpp:7640](KncWX2Server/GameServer/GSUserFunction.cpp#L7640),
+  inside `CheckCharLevelUp`, gated on `SERV_CHAR_LEVEL_UP_ITEM`, i.e. the flag
+  added for this very item — then `EGS_CHAR_LEVEL_UP_NOT` at `:7675` / `:7687`.
+  `PushLevelUp` now does the same, so **this fixes the dungeon-clear bonus
+  level-up too**, which had the same staleness anywhere outside a room. In the
+  village the client answers it with `GetSelectUnit()->Reset( m_kUnitInfo )`
+  ([X2State.cpp:10601](X2Lib/X2State.cpp#L10601)) — a full `SetKUnitInfo`,
+  level and EXP and SP together — and `RefreshMenuInfo` repolls the gauge off
+  that unit ten times a second ([X2StateMenu.cpp:513](X2Lib/X2StateMenu.cpp#L513)).
+
+  **It is deliberately not sent inside a room**, diverging from `:7640`:
+  `CX2StateDungeonGame::Handler_EGS_UPDATE_UNIT_INFO_NOT` sets
+  `m_bReceive_KEGS_UNIT_INFO_UPDATE` ([X2StateDungeonGame.cpp:3062](X2Lib/X2StateDungeonGame.cpp#L3062)),
+  the second half of the dungeon Leave gate that offline arms on purpose and
+  only on the leave path ([Handlers_Room.cpp:1219](X2Lib/Offline/Handlers_Room.cpp#L1219)),
+  and calls `ResetDungeonRewardItem`. A run gets its refresh from the end-game
+  push instead ([Handlers_Room.cpp:3000](X2Lib/Offline/Handlers_Room.cpp#L3000)).
+
+- **A fourth refusal was added that this plan did not call for.**
+  `CX2EXPTable::GetEXPData` returns a **zero-filled** `EXPData` for a level it
+  has no row for ([X2EXPTable.cpp:43-54](X2Lib/X2EXPTable.cpp#L43)) rather than
+  failing. So a missing row reads as "total EXP 0", the top-up
+  `iNextLevelTotalEXP - m_iEXP` comes out **negative**, and
+  `ApplyDungeonReward` clamps that to `iEXP = 0` — a consumed scroll that wipes
+  the character's progress. Refused pre-consume when
+  `iNextLevelTotalEXP <= kUnit.m_iEXP`, with the item intact and the two figures
+  in the log.
+- **`FillAckED` was added here**, so phase 34 of `OFFLINE_MODE_PHASE29_PLAN.md`
+  inherits it and is down to two handlers. That document has been corrected.
+- **The scroll is purchasable in the offline shop** — `cash_product` row 2361
+  sells item 160267 for 5 of currency 43 — so the exit test needs no packing and
+  no hand-edited save. 60004276 is **not** in the shop, so its refusal is
+  reachable only if the item is obtained some other way; the branch is there and
+  logged, untested.
+
+---
+
+# Phase 37 — Route A: the item-use effect switch
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+**Run after phase 36** — same handler.
+
+### Symptom
+Most items that can be right-clicked from the bag are consumed and do nothing.
+The skill-unseal books and the skill note work; everything else is eaten.
+
+### Diagnosis — CONFIRMED
+`Handler_EGS_USE_ITEM_IN_INVENTORY_REQ` implements exactly three effects: the
+unseal book (`:238-260`, `:359-369`), the skill note (`:272-302`, `:375-386`),
+and the in-room buff/ability `_NOT` (`:339-352`). Everything else falls to
+`ConsumeOne` and a bare ACK (`:304-314`).
+
+The live server's equivalent switches are the validation arm at
+[GSUserInventory.cpp:3944](KncWX2Server/GameServer/GSUserInventory.cpp#L3944)
+(cases running from roughly `:4000` to `:4530`) and the effect arm at
+[`:4535`](KncWX2Server/GameServer/GSUserInventory.cpp#L4535) (cases to `:4935`).
+Read only those (§0.2).
+
+**Scope comes from the client, not from item names.** `X2UIInventory.cpp`
+enumerates ~120 route-A item IDs by named constant, in two switches:
+[`:5994-6113`](X2Lib/X2UIInventory.cpp#L5994) (the pre-check) and
+[`:6214-6898`](X2Lib/X2UIInventory.cpp#L6214) (the dispatch). Families present:
+`WARP_ITEM_*`, `NICKNAME_CHANGE_CARD_ITEM_ID`, `INIT_SKILL_TREE_*`,
+`RURIEL_RESET_SKILL_ITEM`, `ITEM_FOR_SEAL_*` (the Phoru stamps),
+`SKILL_POINT_*` / `SKILL_PLUS_ITEM_ID`, `GOLD_TICKET_*`,
+`INVENTORY_SLOT_ADD_ITEM_*_EVENT`, `PROTECTION_OF_*`, `BELSSING_OF_*`,
+`ELIXIR_*`, `NASOD_SCOPE_*`, `CHANGE_PET_NAME_ITEM_ID`, `GUILD_CREATE_ITEM_ID`,
+`INIT_GUILD_SKILL_TREE_ITEM_ID`, the wedding/couple items,
+`ACTIVATION_DROP_ITEM_PICKUP_SKILL`, `HALLOWEEN_TRANSFORM_POSION`,
+`UNLIMITED_SECOND_CHANGE_JOB_ITEM_ID`, `RECOMMEND_TICKET_ID`.
+
+Note several of those already have a client-side case that does **not** reach
+`EGS_USE_ITEM_IN_INVENTORY_REQ` — the warp scrolls open a village menu, the
+elixirs go through the quick-slot `_NOT`. Cross the two lists before assuming a
+constant needs server work.
+
+### What to do
+
+1. **Census first.** Add the §0.9 diagnostic line to the handler, play for a
+   session using whatever the save actually holds, then
+   `grep "ITEM     used item" offline_server.log | sort | uniq -c | sort -rn`.
+   Name every ID that appears via `ItemTrans.lua`. That list — not the full 120
+   — is the phase's real scope.
+2. **Group by what the effect needs**, and do the groups that need nothing new
+   first. In rough order of cheapness:
+   - **Inventory expansion** (`INVENTORY_SLOT_ADD_ITEM_*_EVENT`,
+     `CI_EXPAND_INVENTORY_*`) — `CX2OfflineInventory` already has per-category
+     maxima; this is a stored counter and an ACK field.
+   - **Skill-point items** (`SKILL_POINT_*`) — `CX2OfflineSkill` already tracks
+     CSP; the live path is `DBE_INSERT_CASH_SKILL_POINT_REQ` with an
+     `m_iCSPoint` and an `m_iPeriod`.
+   - **Skill reset / init** (`INIT_SKILL_TREE_*`, `RURIEL_RESET_SKILL_ITEM`) —
+     `CX2OfflineSkill` owns the tree already.
+   - **Nickname / pet-name change** — a single column write.
+   - **The Phoru stamps** (`ITEM_FOR_SEAL_*`) — these belong to phase 39; leave
+     them and say so.
+   - Anything needing a system that does not exist offline (guild creation,
+     weddings) — **refuse with the item intact** and a log line naming the
+     system. That is a finished outcome for this phase, not a deferral.
+3. For each group, transcribe the live validation case *and* the live effect
+   case. A validation case without its effect is how an item gets consumed for
+   nothing.
+4. Keep the switch ordered and commented to mirror the server's, so a future
+   reader can diff them.
+
+### Trap
+- The handler currently refuses everything with `GetCanUseInventory() == false`
+  (`:215-223`). That check is **correct and stays** — the client never sends
+  route A for such an item, so anything hitting it arrived by another door.
+- Several live cases end in `SendToGameDB(...)` and `return` — their real effect
+  is in the `DBE_*_ACK` handler, not the `EGS_*_REQ` one. Follow the DB round
+  trip before concluding a case does nothing.
+- Do not batch this into one commit. One group per commit, each with its own
+  play-test.
+
+### Exit test
+For each group implemented: use the item, see the effect, and confirm
+`select … from unit` / the relevant offline table changed. For each group
+refused: the item is **still in the bag** afterwards and the log names it.
+`grep "used item" offline_server.log` should have no entry that is neither
+implemented nor explicitly refused.
+
+### As built — 2026-09-08
+
+**DONE 2026-09-08.** Built, deployed, and closed by the user after reviewing the
+named list of what works and what is refused — see *The user's verdict* at the
+end of this section. One follow-up is owed out of that review and is scoped
+there: the Gnosis Blessing (cash-skill-point) family, which the user does want
+working.
+
+Not play-tested: the save holds none of these items, so the exit test below was
+never run. It is kept as a checklist rather than as a blocker.
+
+#### The census, done statically, because the log had nothing in it
+
+Step 1 of this phase asked for a play-session census. `offline_server.log`
+carries exactly one distinct entry — `used item 160267`, twenty times, all of it
+phase 36's own testing — so there was nothing to count. The scope was derived
+instead, and the derivation is stronger than a session would have been because
+it does not depend on what the save happens to hold:
+
+1. **What the US client can send.** `CX2UIInventory::OnRClickedItem`'s dispatch
+   switch ([X2UIInventory.cpp:6119-6894](X2Lib/X2UIInventory.cpp#L6119)) plus
+   the eight message boxes that call `Handler_EGS_USE_ITEM_IN_INVENTORY_REQ`
+   after an OK ([`:1380`](X2Lib/X2UIInventory.cpp#L1380), `:1394`, `:1407`,
+   `:2036`, `:2049`, `:2502`, `:2707`, `:2839`), with every case struck out
+   whose flag is off in `US_SERVICE`.
+2. **What the live server does with what arrives.** The validation arm at
+   [GSUserInventory.cpp:3979](KncWX2Server/GameServer/GSUserInventory.cpp#L3979)
+   and the effect arm at [`:4556`](KncWX2Server/GameServer/GSUserInventory.cpp#L4556)
+   — the `DBE_USE_ITEM_IN_INVENTORY_ACK` handler actually opens at `:4526`, not
+   the `:4535` this document says.
+
+**The flag check killed half the families this phase was scoped for.** Checked
+against `ServerDefine.h` + `ServerDefine_Global.h` + `ServerDefine_US.h`, which
+is the whole active set for US:
+
+| family | flag | US |
+|---|---|---|
+| inventory-expansion event items | `SERV_EXPAND_INVENTORY_BY_EVENT_ITEM` | **on** (US) |
+| pet auto-looting | `PET_DROP_ITEM_PICKUP` / `SERV_PET_AUTO_LOOTING` | **on** |
+| halloween transform potion | `SERV_HALLOWEEN_PUMPKIN_FAIRY_PET` | **on** (Global) |
+| gold tickets | `SERV_GOLD_TICKET` | off — TWHK |
+| character-slot expand cards | `SERV_EVENT_CHARACTER_SLOT_EXPAND_ITEM` | off — TWHK |
+| tour ticket | `SERV_TOUR_TICKET_EVENT` | off — nowhere |
+| recruit ticket | `SERV_RECRUIT_EVENT_BASE` | off — nowhere |
+| wedding / couple items | `ADDED_RELATIONSHIP_SYSTEM` | off — nowhere |
+| VIP warp pass | `SERV_VIP_SYSTEM` | off — CN |
+| unlimited 2nd job change | `SERV_UNLIMITED_SECOND_CHANGE_JOB` | off — CN/EU |
+
+So `INVENTORY_SLOT_ADD_ITEM_*_EVENT`, `GOLD_TICKET_*` and the rest that this
+phase's diagnosis listed are **not one list**: only the first is reachable here.
+Nothing was written for the eight off families — this client cannot produce
+them.
+
+**Three more named families never take route A at all**, which the diagnosis
+warned about and which is worth writing down so the next reader does not chase
+them: the skill-reset medals (`INIT_SKILL_TREE_*`, `RURIEL_RESET_SKILL_ITEM`)
+send `EGS_INIT_SKILL_TREE_REQ` via `UIM_SKILL_INIT_OK`
+([X2UIInventory.cpp:1367](X2Lib/X2UIInventory.cpp#L1367)), the guild-skill
+medal sends `EGS_INIT_GUILD_SKILL_TREE_REQ` ([`:2599`](X2Lib/X2UIInventory.cpp#L2599)),
+and the Nasod scope, the guild-create stone and the pet-name card all open a
+dialog that sends something else entirely.
+
+**And one the diagnosis got backwards.** It says "the warp scrolls open a
+village menu"; the six `WARP_ITEM_*_ITEM_ID` scrolls do not — they pop a yes/no
+box and `UIM_ITEM_USE_WARP` sends route A ([`:2036`](X2Lib/X2UIInventory.cpp#L2036)).
+It is `WARP_ITEM_FREE_ITEM_ID` / `WARP_ITEM_ED_CONSUMPTION_ITEM_ID` that open
+the menu — and those send route A too, one step later, through
+`UIM_WARP_DEST_OK` ([`:2502`](X2Lib/X2UIInventory.cpp#L2502)).
+
+#### What was implemented
+
+Four families, all in `Handler_EGS_USE_ITEM_IN_INVENTORY_REQ`, laid out in the
+server's own order: validate everything before the consume, apply everything
+after the reply.
+
+- **Village-return scrolls** — 109995 Ruben, 109996 Elder, 109997 Besma,
+  109998 Altera, 110832 Peita, 110847 Velder. The whole effect is the ACK's
+  `m_iWarpPointMapID`: the client checks it against `IsValidWarpField` and
+  drives the state change itself ([X2UIInventory.cpp:8935-8960](X2Lib/X2UIInventory.cpp#L8935)).
+  No `CheckEnterTheVillage`, for the reason `Handler_EGS_WARP_BY_BUTTON_REQ`
+  already wrote down: this build trusts the client's own destination list
+  rather than rebuilding a level/dungeon-clear gate it has no data for.
+
+- **The two Cobo Express passes** — 215660 free, 112323 ED. **These are the one
+  route-A family that is not consumed**: the live handler sets `bNotDeleteItem`
+  for both ([GSUserInventory.cpp:4008](KncWX2Server/GameServer/GSUserInventory.cpp#L4008)).
+  They are passes, not tickets. The destination arrives in `m_iTempCode`, the
+  same-map / not-a-Cobo-pair refusal is transcribed from `:4024-4033`, and the
+  fare comes from `CX2OfflineMapData::ComputeCOBOExpressTicketCost` — the
+  machinery phase 13 already stood up for the B button, reused verbatim.
+
+- **The six inventory-expansion event items** — 60002281..60002286. Cap checked
+  before the consume (`ERR_BUY_CASH_ITEM_19`, the live code at `:4397`), then
+  `ExpandCategorySlot` and **`EGS_EXPAND_BANK_SLOT_NOT`**. That last one is the
+  non-obvious half: despite the name it is the general "a category grew" push
+  ([GSUserGameCommon.cpp:6205-6240](KncWX2Server/GameServer/GSUserGameCommon.cpp#L6205)
+  routes `EGS_USE_ITEM_IN_INVENTORY_REQ`'s expansion to it), and the client's
+  handler adds to `GetItemMaxNum` for whichever category it names
+  ([X2UIInventory.cpp:3253-3282](X2Lib/X2UIInventory.cpp#L3253)). Without it
+  the slots exist in `els_db.sql` and the bag draws the old size until relog.
+
+- **The pet auto-looting item** — 500720, and **the only one of the four the
+  offline shop already sells**, so it is the one to test first.
+  `KGSUser::CanIUseTheAutoLootingItem` ([GSUserFunction.cpp:2848](KncWX2Server/GameServer/GSUserFunction.cpp#L2848))
+  transcribed: the pet must exist (`ERR_PET_26`), be past the egg stage
+  (`ERR_PET_27`), and not already have the skill (`ERR_PET_28`). The egg test
+  has an exception for a pet born fully grown — `CXSLPetManager::IsEvolutionExceptionPet`
+  is "exactly one growth stage and it is stage 3"
+  ([XSLPetManager.cpp:1191](KncWX2Server/Common/X2Data/XSLPetManager.cpp#L1191)),
+  and the *client's* `PetTemplet::m_vecPetStatus` carries the same vector, so
+  this is the same test rather than a port of a server-only table. The
+  `unit_pet.auto_looting` column has existed since phase 7; nothing migrated.
+
+#### What is refused, by name, with the item intact
+
+Per this phase's own rule that a refusal naming the missing system is a
+finished outcome and not a deferral. All of them answer
+`ERR_USE_ITEM_IN_INVENTORY_03` ("this item cannot be used from the inventory")
+and log which subsystem is absent:
+
+| item(s) | missing system |
+|---|---|
+| 99380 `SI_BANK_MEMBERSHIP_UPGRADE` | the account bank — `EGS_GET_SHARE_BANK_REQ` already answers size 0 |
+| 160060–160067 `SI_PSHOP_AGENCY_*` | the private-shop agency |
+| 209660 nickname-change card | renaming a character; `Handlers_Unit.cpp` has no rename path and the live effect is `DBE_DELETE_NICK_NAME_REQ` → character select |
+| 110859 guild cash skill | guilds — the live effect is a packet to the **Login** server |
+| 90002300 halloween transform potion | `PetData.lua`'s `AddTransformPetItemInfo` rows, which `CX2OfflinePetData` binds as a no-op stub ([X2OfflinePetData.cpp:281](X2Lib/Offline/X2OfflinePetData.cpp#L281)) |
+| the 15-odd `SKILL_POINT_*` / `SKILL_PLUS_ITEM_ID` ids | cash skill points |
+| `ITEM_FOR_SEAL_*` (Phoru stamps) | the seal packets — **phase 39**, and the log line says so |
+
+**The cash-skill-point refusal is the one judgement call in this phase.** The
+diagnosis listed it as cheap ("`CX2OfflineSkill` already tracks CSP"). It does
+not: `X2OfflineServer.cpp:914-916` reports `m_iCSPoint` and `m_iMaxCSPoint` as
+zero on every character on purpose, and `CX2OfflineSkill` pays for every skill
+in plain SP ([X2OfflineSkill.cpp:435](X2Lib/Offline/X2OfflineSkill.cpp#L435)) —
+which is the branch the real server also takes for an account with no
+cash-skill ticket, not a special case. Granting a pool with no way to spend it,
+and no expiry column to store its end date in, is worse than refusing; a real
+implementation is a phase of its own (it would want `settings`, not a
+migration — §0.5 still holds).
+
+#### Route A is now complete against live, for this client
+
+Worth stating because it is checkable. The live `default:` arm
+([`:4873-4924`](KncWX2Server/GameServer/GSUserInventory.cpp#L4873)) does exactly
+two things for an item with no named case: unseal a skill, and extend an
+already-owned periodic title. Both are already offline — phase 21's unseal and
+phase 6's `CX2OfflineTitle::OnUseItem`, which is also how a *new* title item
+works on live (it completes a `TMCT_USE_ITEM` title mission; the use-item
+switch never grants one directly). So every route-A item is now either
+implemented, refused by name, or lands in a `default:` that does the same
+nothing live's does.
+
+#### Two other changes
+
+- **The success log line is now the census line.** It carries the item's type,
+  special-ability count and buff-factor count as well as its ID, so
+  `grep "ITEM     used item" offline_server.log` answers §0.9's route question
+  for anything a future session uses. This replaces the temporary
+  `SERV_IRUHADEV_*_DEBUG` diagnostic the phase called for — one line per bag
+  use is not per-frame logging, and a permanent census beats a throwaway one.
+- **`EGS_RESOLVE_ITEM_REQ` deleted from the ignore list** (§0.7's cleanup). It
+  was listed *and* dispatched to a real handler; dispatch wins, so behaviour
+  was right and the list was lying.
+
+#### Exit test — kept as a checklist, not run
+
+The save holds none of these items, so this needs items put in the bag first
+(the cash-shop tool, or a `cash_product` row). In priority order:
+
+1. **500720 pet auto-looting** — already purchasable. Summon a pet past the egg
+   stage, use the item, confirm it picks drops up, and
+   `select pet_uid, auto_looting from unit_pet;`. Then use a second one and
+   confirm it is **refused with the item still in the bag** (`ERR_PET_28`).
+2. **60002281** (or any of the six) — bag grows by 8 slots **without a relog**,
+   and `select category, size from inventory_size;` agrees.
+3. **109995** in a village other than Ruben — the client warps.
+4. **112323 / 215660** — pick a destination, confirm the warp happens, the ED
+   drops by the Cobo fare (0 for 215660), and **the pass is still in the bag**.
+5. Any refused item — still in the bag, and `grep "left in the bag"
+   offline_server.log` names the system.
+
+#### The user's verdict on the refusals — 2026-09-08
+
+**Phase 37 is closed.** Shown the full named list of what is implemented and
+what is refused, the user accepted every refusal **except one**:
+
+> "the 'Refused by name' items cannot be use but that's okay beside gnosis
+> blessing items"
+
+So the bank letter, the nickname card, the guild blessing, the Halloween potion,
+the private-shop agency and the Phoru stamps stay refused and nobody is waiting
+on them. **The cash-skill-point family is owed** — the user wants
+Gnosis Blessing to actually work.
+
+#### Owed: cash skill points, and why it is a phase of its own
+
+Sized against the live code, not guessed. "Grant N points" is one of six parts,
+and offline has one of them wired:
+
+| part | live | offline today |
+|---|---|---|
+| per-skill CSP spent | `UserSkillData::m_iSkillCSPoint` | `unit_skill.csp` column exists, always written 0 ([X2OfflineDB.cpp:1868](X2Lib/Offline/X2OfflineDB.cpp#L1868), `:1897`) |
+| remaining CSP | `KUserSkillTree::m_iCSPoint` | `unit.csp` column exists, always written 0 (`SaveSkillPoint` is called with a literal `0`) |
+| granted pool + expiry date | `m_iMaxCSPoint`, `m_tCSPointEndDate` | **no storage at all** |
+| the three unit-info fields | filled from the above | hardcoded `0 / 0 / "2000-01-01 00:00:00"` ([X2OfflineServer.cpp:914](X2Lib/Offline/X2OfflineServer.cpp#L914)) |
+| spend CSP before SP | `GetNecessarySkillPoint` ([UserSkillTree.cpp:1225-1342](KncWX2Server/GameServer/UserSkillTree.cpp#L1225)) — while unexpired the cost goes to `m_iSpendSkillCSPoint`, CSP is drained first, the remainder comes off SP | `LearnSkills` hardcodes the `IsCashSkillPointExpired() == true` arm ([X2OfflineSkill.cpp:435](X2Lib/Offline/X2OfflineSkill.cpp#L435)) |
+| **expiry rollback** | `CalcExpireCashSkillPoint` / `ExpireCashSkillPoint` ([UserSkillTree.cpp:544](KncWX2Server/GameServer/UserSkillTree.cpp#L544), `:646`) walk back every level a skill bought with CSP, refund the SP, then `EGS_EXPIRE_CASH_SKILL_POINT_NOT` carries the surviving tree | **does not exist** |
+
+Three findings that make the phase cheaper than it looks:
+
+- **No schema migration.** The two per-row columns are already there and already
+  round-trip; they just carry zeros. The pool and the expiry date fit in the
+  existing `settings` key/value table (`GetSetting`/`SetSetting`,
+  [X2OfflineDB.cpp:2859](X2Lib/Offline/X2OfflineDB.cpp#L2859)), keyed per unit.
+  §0.5 still holds.
+- **`IsCashSkillPointExpired()` is just `0 == m_iMaxCSPoint`**
+  ([UserSkillTree.cpp:534](KncWX2Server/GameServer/UserSkillTree.cpp#L534)) —
+  not a date comparison. The date only matters to the login-time sweep that
+  zeroes the pool. So all the in-session logic keys off one integer.
+- **The grant is a `_NOT`, not an ACK field**:
+  `EGS_UPDATE_CASH_SKILL_POINT_NOT` after setting pool, remaining and end date
+  ([GSUserCashShop.cpp:6094-6127](KncWX2Server/GameServer/GSUserCashShop.cpp#L6094)).
+  `m_bUpdateEndDateOnly` distinguishes "new pool" from "extend the rental", and
+  the live validation refuses a blessing of a *different* point value while one
+  is still running (`ERR_BUY_CASH_ITEM_32`, GSUserInventory.cpp:4214-4229) —
+  which is also what stops the pool from stacking without limit.
+
+Also needed and easy to miss: **skill reset must refund to the CSP pool, not to
+SP.** `ResetSkill` / `InitSkillTree` returning CSP-bought points as plain SP
+would launder a rental into permanent skill points.
+
+**The approach is not decided.** Three were put to the user and the phase was
+closed before a choice was made:
+
+1. *Faithful minus the sweep* — everything above except the expiry rollback, so
+   the rental never actually runs out. Keeps the live cap, skips the one large
+   piece.
+2. *Fully faithful* — including the rollback, i.e. you lose the CSP-bought
+   levels when the rental ends.
+3. *QoL* — the blessing just adds its point value to real SP, permanently. An
+   hour's work, but unlimited SP by repeat purchase, and it would belong in
+   `MODS.md` as a gameplay change rather than here as emulation.
+
+Whoever picks this up: **ask first**, then write it as its own phase. Do not
+fold it back into `Handler_EGS_USE_ITEM_IN_INVENTORY_REQ` as a special case —
+five of the six parts above are in `CX2OfflineSkill` and `X2OfflineServer`, not
+in the item handler.
+
+---
+
+# Phase 38 — Cube coverage: registry vs. contents
+
+**Flag:** `SERV_IRUHADEV_OFFLINE` (likely no code change at all)
+
+### Symptom
+Some cubes refuse to open with
+`CUBE refused - item %d has no row in RandomItemTable.lua`.
+
+### Diagnosis — investigation, not yet confirmed
+Route B has **two** tables and they are different files (§0.4):
+
+- `RandomItem.lua` — the **client's** registry. Decides whether the client will
+  even send `EGS_OPEN_RANDOM_ITEM_REQ` ([X2UIInventory.cpp:6927](X2Lib/X2UIInventory.cpp#L6927)).
+- `RandomItemTable.lua` — the **contents**, loaded by `CX2OfflineRandomItem`.
+
+An item in the first but not the second is a cube the client offers and the
+offline server refuses. Whether that set is empty is unknown and is this phase's
+question.
+
+### What to do
+1. Decrypt both (§0.9). Extract the cube IDs from each — for `RandomItem.lua`
+   the rows are `AddRandomItemTemplet( id, keyID, keyCount, requiredED )`
+   ([X2ItemManager.cpp:1592](X2Lib/X2ItemManager.cpp#L1592)); note the constant
+   pool de-duplicates, so a naive number scan mixes IDs with key IDs and counts —
+   treat a set difference as a lead, not a verdict.
+2. Cross-check the leads against `CX2OfflineRandomItem::GetCube` at runtime
+   rather than on paper, and name each one via `ItemTrans.lua`.
+3. Check the load actually succeeded: `grep "CUBE" offline_server.log` for the
+   loader's own row-count line. `RandomItemTable.lua` is 7.9 MB and the load is
+   lazy — nothing touches it until the first cube is opened, so an empty log
+   means "not yet exercised", not "fine".
+4. **If the difference is empty, the phase's deliverable is that finding**, added
+   to this document. Do not invent work.
+5. If it is not empty, the honest options are: confirm the missing cubes are
+   region-dead (compare against `KncWX2Server/ServerResource/*/RandomItemTable.lua`
+   for the other regions), or leave them refused with a clearer log line. **Do
+   not fabricate contents for a cube.**
+
+### Trap
+`SERV_CUBE_IN_ITEM_MAPPING` is on, but `RandomItemMapping.lua` is 100% comments
+in the US branch, so the live US server swaps nothing either — the offline
+no-op is correct and is already documented at
+[X2OfflineRandomItem.h:49-53](X2Lib/Offline/X2OfflineRandomItem.h#L49). Do not
+"fix" it.
+
+### Exit test
+A written answer with numbers: how many cubes the client registry lists, how
+many the contents table covers, and the named list of any difference. Plus a
+play-test opening at least one cube of each shape the save can reach
+(single-draw, give-all, key-required, ED-required).
+
+### What actually happened — 2026-09-08
+
+**The difference is not empty, and there is a second one the phase did not
+anticipate. Neither is fixable and both are live-faithful, so the deliverable is
+the numbers plus two clearer log lines.** Nothing was fabricated.
+
+#### The method, because §0.9's crude scan was not good enough
+
+A constant-pool scan cannot answer this: the pool de-duplicates, and cube IDs,
+key IDs, key counts and ED costs are all just numbers in it. So both files were
+run through a **full Lua 5.1 undumper plus instruction decoder** instead —
+`SELF`/`CALL` gives the exact argument list of every
+`AddRandomItemTemplet` / `AddRandomItemGroup` call, and `SETTABLE` gives each
+table-constructor field by name. Two decoder facts worth keeping:
+
+- **`RK` operands only reach constant index 255.** Above that the compiler
+  `LOADK`s into a register first, so a decoder that reads only the RK bit finds
+  `AddRandomItemTemplet` (interned early) and silently misses all 90,770
+  `AddRandomItemGroup` calls. Resolve the method name through the register map
+  as well.
+- **The implicit `self` is argument 1.** `a:b(x)` puts `x` at `R(A+2)`.
+
+The result was then **corroborated against a genuinely independent source**
+(§0.2's rule about coherent-but-wrong sources): the plaintext
+`KncWX2Server/ServerResource/US/RandomItemTable.lua`, parsed by regex. Both give
+4360 templet blocks and **the same 4314 distinct cube IDs, zero difference in
+either direction**, and the same 9856 group IDs. The packed `data036/` copy is
+the US table, compiled.
+
+#### The numbers
+
+| | count |
+|---|---|
+| `RandomItem.lua` — client registry (route B gate) | **4378 rows, 4332 distinct cube IDs** |
+| `RandomItemTable.lua` — contents | **4360 templet blocks, 4314 distinct cube IDs**; 90,770 group rows in 9856 groups |
+| registry minus contents — client offers it, contents silent | **18** |
+| contents minus registry — contents cover a cube the client never opens | **0** |
+| `(cube, key)` pairs | 4378 vs 4360, both duplicate-free; same 18 / 0 split |
+
+So **the registry is shipped region-neutral while the contents table is
+per-region**, and that is the whole cause of the first difference.
+
+What the offline loader will actually serve, predicted from the two files and the
+client's own `Item.lua` (48,754 item templets):
+
+| | count |
+|---|---|
+| `m_iCubeRows` kept | **1896** (1884 distinct cubes) |
+| `m_iCubeDropped` | **2464** — all of them "no client item templet"; 0 for an empty unit-group list, 0 for a duplicate `(cube, key)` |
+| `m_iGroupCaseRows` kept | **90,770 of 90,770** — the loader's guard rejects none |
+| shapes among the 1896 | 1097 give-all, 799 single-draw, 219 key-required, 11 ED-required, 52 resurrection, 2 stamina; 1369 `UC_ANYONE`, 401 `UC_ONE_UNIT`, 126 `UC_ONE_CLASS` |
+
+Those are the numbers to check the next play-test's `CUBE loaded:` line against.
+
+#### Difference 1 — the 18 registry-only cubes
+
+All 18 have a client item templet, so a player really can hold one and click it.
+15 are in the **EU and/or CN** `RandomItemTable.lua` and not the US one; 3 are in
+none of the three.
+
+| item id | name (`ItemTrans.lua`) | in which region's table |
+|---|---|---|
+| 273060 | Pet Toy (30 days) Cube | none |
+| 60007856 | Orbs Random Cube | EU, CN |
+| 60008000 | Unstoppable Ara Cube | EU, CN |
+| 60008003 | Unstoppable Little Devil Cube | EU, CN |
+| 60008004 | Ara El Search Party Officer (1 Day) Full Set Cube | EU, CN |
+| 60008005 | (KR name only in `ItemTrans.lua`) | EU, CN |
+| 60008008 | 4 Ring of Skills (7 Days) Random Cube | EU, CN |
+| 60008009 | Little Devil's Helping Cube | EU, CN |
+| 60008013 | Victory Trophy Cube | EU, CN |
+| 60008014 | Ara's New Job Celebration Cube | EU, CN |
+| 60008015 | (KR name only in `ItemTrans.lua`) | EU, CN |
+| 60008023 | 2nd Job Promotion Weapon (Poison) (3 Days) Cube | EU, CN |
+| 65001078 | Weak Heretic Essence Cube | none |
+| 67004636 | Resurrection Stone Cube | EU, CN |
+| 85003780 | Ara's Archangel (3 Days) Full Set Cube | EU, CN |
+| 85003800 | 2nd Job Congratulatory Cube | EU, CN |
+| 85003820 | Sealed Ice Sculpture (Ara, Archangel) — key 85003821 x1 | EU |
+| 90003110 | Lunar New Year Dumpling Steamer | none |
+
+None of the 18 appears even as a commented-out block in the US source. **The
+live US GameServer loads the same US table and refuses all 18 identically**, so
+this is region-death, not an offline gap.
+
+#### Difference 2 — 18 cubes that load and name an item group with no rows
+
+Not anticipated by the phase, and only visible once both tables are in hand: **18
+cubes pass the loader and name an item group that has no `AddRandomItemGroup`
+rows at all.** They reach `GetResult`, resolve a non-zero group ID, find nothing
+under it, and return false.
+
+The play-test corrected the split. It is **8 dead outright and 10 dead for
+exactly one class**, not 18 and 0 — a paper count of "cubes with at least one
+missing group" was read as "cubes with every group missing", which the runtime
+census immediately disproved. The 10 are the more interesting half.
+
+**8 that can never pay out** — every group they name is undefined:
+
+- `60001210` Accessory Random 15 Days Cube (its one group, 60001210)
+- `65000104`-`65000110`, the seven El Scout 5-day cubes (all 12 of each cube's
+  groups: 130550-130574, 130646-130649, 130717-130720)
+
+**10 that work for every class but one.** All are `UC_ONE_UNIT`, and in each the
+single missing group is a **late-added character's** row:
+
+| cubes | missing class | groups |
+|---|---|---|
+| `133252`, `133254`, `133256`, `133258` — Advanced/Elegant Weapon Cubes Lv. 36-60 | `UC_ELESIS_KNIGHT` (1 of 8) | 60108, 60118, 60128, 60138 |
+| `160015`-`160020` — the six costume cubes | `UC_CHUNG_IRON_CANNON` (1 of 6) | 500126-500176 |
+
+The fingerprint is visible in the numbering: in `133252` the Elesis entry carries
+group **60108** while the seven others run 60100-60106, i.e. the ID was allocated
+out of sequence when the class was appended and never given rows. **So an Elesis
+cannot open an Advanced Weapon Cube and a Chung cannot open a costume cube, while
+every other class can** — which is exactly the shape of refusal that looks like
+an offline bug and is not one.
+
+Checked by grep with a control, in all three region sources: **every one of those
+group IDs is defined in none of US, EU or CN**, while a control group (14834) is
+present in all three. Same verdict — a hole in the studio's own data, dead on
+live too.
+
+#### What was changed
+
+Only log lines, all inside `X2Lib/Offline/` (all three files ASCII/LF; verified
+unchanged after editing):
+
+1. **`GetResult` now says why it declined** — a `DRAW_FAIL` enum
+   (`DF_NO_GROUP_FOR_CLASS`, `DF_GROUP_EMPTY`, `DF_ODDS_MISSED`) returned through
+   a new `OUT int&`. One call site. Previously all three collapsed into
+   `"drew nothing for class %d"`, which made a permanent data hole read as a
+   dice roll.
+2. **The handler's two refusals now name the cause**: the registry-only case says
+   the cube is region-dead and the live US server refuses it too; the empty-group
+   case says the group is undefined in every region.
+3. **A load-time census** of difference 2, counted off the two maps the loader
+   already builds: `m_iCubeNoGroupAtAll` / `m_iCubeSomeGroupMissing`. It reports
+   **8 and 10**, and it is what corrected the paper split above — worth keeping
+   as the cheapest example in this batch of a diagnostic paying for itself on its
+   first run.
+
+Difference 1's census was deliberately *not* added to the log:
+`CX2ItemManager::m_multimapRandomItem` is `private` and reaching it means editing
+`X2ItemManager.h`, a **CP949** file that `CLAUDE.md` says has already been
+destroyed twice. The numbers are in this document instead.
+
+#### Play-test reachability, measured against the save
+
+The save (`reyaa` lv80 / `Freils` lv27 / `Iivue` lv40) already holds cubes for
+three of the four shapes, and the exit test's fourth is **not reachable**:
+
+| shape | how to reach it |
+|---|---|
+| single-draw + ED-required | `111064` **Old Wooden Box** (ED 12,500) on `Freils`, `111068` **Lavish Gold Box** (ED 200,000) on `reyaa` — both held now |
+| give-all | buy `61206` **Ruined Time and Space Crystal** (`cash_product` row 2, 100 of currency 1) or `65000221` **Ariel's Gift Box** (row 2364, 1 of currency 43); the account holds 62,200 |
+| stamina | `77200` **Stamina Potion** on `reyaa` — expected to *refuse*, since stamina is not modelled offline; that is the intended behaviour |
+| key-required | `160773` **Unidentified Ancient Fossil** is held on all three characters, but its key `67006749` is not held, not in `cash_product`, and not in the US `DropTable.lua` — of all 219 servable key-required cubes, **zero** have their key held or purchasable, so this was written up as unreachable. The user supplied the key anyway and it opened. |
+
+#### Play-test verdict — 2026-09-08, PASSED
+
+All four shapes opened, including the key-required one this document had called
+unreachable. The log's own figures:
+
+```
+CUBE  loaded: 1896 cube(s) in 1884 key set(s), 90770 case(s) across 9856 group(s); 2063 presentation row(s)
+CUBE  NOTE 2464 cube templet(s) dropped - no item templet for the cube itself in this client's .kom.
+CUBE  NOTE 8 cube(s) loaded that can never pay out ... (10 more are missing a group for only some classes)
+CUBE  opened item 160773 (single draw, key 67006749): 2 item kind(s)
+```
+
+Every predicted number matched — 1896 cubes, 1884 key sets, 90,770 cases, 9856
+groups, 2464 dropped — **except** the difference-2 split, corrected above.
+
+---
+
+# Phase 39 — `EGS_UNSEAL_ITEM_REQ` / `EGS_SEAL_ITEM_REQ`
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+**Must land before phase 40.**
+
+### Symptom
+Both packets are declined (§0.7), so a bound item can never be unbound and a
+Phoru's Foot Stamp can never be used.
+
+### Diagnosis — CONFIRMED
+Read §0.6 first; the seal field is not what it looks like.
+
+The GameServer handlers are thin wrappers:
+[`EGS_SEAL_ITEM_REQ` at `:7381`](KncWX2Server/GameServer/GSUserInventory.cpp#L7381)
+and [`EGS_UNSEAL_ITEM_REQ` at `:7476`](KncWX2Server/GameServer/GSUserInventory.cpp#L7476).
+Both refuse while trading or personal-shopping (`GetTradeUID() > 0 ||
+GetPersonalShopUID() > 0` → `ERR_ITEM_14`) and while the inventory is locked
+(`ERR_INVENTORY_LOCK_00`), then delegate:
+
+- `KInventory::SealItem( iDestItemUID, iSealItemUID, ucBeforeSealCount, ucSealResult, vecUpdated )`
+  — [Inventory.cpp:16330](KncWX2Server/GameServer/Inventory.cpp#L16330)
+- `KInventory::UnsealItem( iDestItemUID, ucSealResult, vecUpdated )`
+  — [Inventory.cpp:16761](KncWX2Server/GameServer/Inventory.cpp#L16761)
+
+`SealItem` is the **grade-matched stamp**: it picks the required stamp item from
+the target's grade ([Inventory.cpp:16502-16509](KncWX2Server/GameServer/Inventory.cpp#L16502)) —
+`IG_UNIQUE → CI_SEAL_ITEM_UNIQUE`, `IG_ELITE → CI_SEAL_ITEM_ELITE`,
+`IG_RARE → CI_SEAL_ITEM_RARE`, `IG_NORMAL → CI_SEAL_ITEM_NORMAL` — then accepts
+the several event variants of each (`CI_EVENT_SEAL_ITEM_*`,
+`CI_RURIEL_EVENT_SEAL_ITEM_*`, `CI_ARIEL_EVENT_SEAL_ITEM_*`, `:16550-16590`),
+refuses an item held in the bank (`IsExistInBank`, `:16535`), and consumes the
+stamp.
+
+The client already gates on the count:
+`GetMaxSealCount() - m_ucTimesToBeSealed` at
+[X2UIInventory.cpp:8027](X2Lib/X2UIInventory.cpp#L8027) and `:7932`.
+
+`KOfflineItemRow::m_iSealData` already exists (§0.5) — no migration.
+
+### What to do
+1. Remove both entries from `X2OfflineIgnore.cpp` (`:63-64`), and delete the
+   stale `EGS_RESOLVE_ITEM_REQ` line at `:61` while you are in the file (§0.7).
+2. Add a `SetSealData( nItemUID, iSealData, OUT KInventoryItemInfo& )` to
+   `CX2OfflineInventory`, in the shape of the existing `SetEnchantLevel` /
+   `SetEndurance` setters ([X2OfflineInventory.h:153-168](X2Lib/Offline/X2OfflineInventory.h#L153)).
+   One setter, absolute value — the caller does the arithmetic, as with enchant.
+3. `Handler_EGS_UNSEAL_ITEM_REQ`: refuse unless `IsSealedItem()`
+   (`m_iSealData >= 100`); otherwise subtract 100, persist, and reply with the
+   updated slot in `m_vecInventorySlotInfo`. Mirror
+   `DBE_UNSEAL_ITEM_ACK`'s ACK fill ([GSUserInventory.cpp:7556-7559](KncWX2Server/GameServer/GSUserInventory.cpp#L7556)).
+4. `Handler_EGS_SEAL_ITEM_REQ`: transcribe the grade→stamp mapping and the event
+   variants from `Inventory.cpp:16502-16590` **verbatim**, refuse a mismatch
+   with the stamp intact, consume the stamp on success, and add 1 to the low part
+   of `m_iSealData` — never letting it cross 100 by accident. Refuse at
+   `GetMaxSealCount()`.
+5. Both handlers: trading and personal shop do not exist offline, so those two
+   refusals are unreachable — say so in a comment rather than porting dead
+   checks.
+
+### Trap
+- **`IS_SEALED` and `KInventory::Seal`/`Unseal` are dead code** (§0.6). If you
+  find yourself writing to `m_iItemState`, you are on the wrong path.
+- **The `>= 100` encoding means arithmetic, not a boolean.** `m_iSealData = 1`
+  is "stamped once, not bound"; `= 100` is "bound, never stamped"; `= 101` is
+  both. Setting it to 0 or 1 to mean "unsealed" destroys the stamp count.
+- `GetMaxSealCount()` is a **templet** property, not an item one — read it off
+  `CX2OfflineInventory::Templet( itemID )`.
+- The Phoru stamps are also route-A items in phase 37's list. They belong here;
+  make sure phase 37 left them alone.
+
+### Exit test
+On an item with `m_iSealData >= 100` in the save: unseal it, watch the seal
+badge clear in the inventory tooltip, and confirm
+`select seal_data from item where item_uid = …` dropped by exactly 100.
+Then apply a grade-matched Phoru stamp: the stamp is consumed, the count rises
+by one, and a grade-*mismatched* stamp is refused **with the stamp still in the
+bag**. Zero `UNHANDLED` for both event IDs.
+
+---
+
+# Phase 40 — Cube fidelity: rental period and the seal
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+**Run after phase 39.**
+
+### Symptom
+Cubes pay out, but timed rewards last forever and bound rewards arrive unbound —
+offline is quietly more generous than live.
+
+### Diagnosis — CONFIRMED
+
+**Period is dropped.** `CX2OfflineRandomItem::KResult` carries `m_iPeriod`
+([X2OfflineRandomItem.h:111](X2Lib/Offline/X2OfflineRandomItem.h#L111)), but
+`CX2OfflineInventory::InsertItem`'s third parameter is `iEnchantLevel`, not a
+period ([X2OfflineInventory.h:145](X2Lib/Offline/X2OfflineInventory.h#L145)),
+and the cube call site passes `0`
+([Handlers_Social.cpp:2843](X2Lib/Offline/Handlers_Social.cpp#L2843)). Every
+row is born with `m_iPeriod = 0` ([X2OfflineInventory.cpp:1511](X2Lib/Offline/X2OfflineInventory.cpp#L1511)),
+i.e. permanent. `KOfflineItemRow` has the column (§0.5).
+
+**Seal is logged but not applied.** `IsSealedCube` is used in exactly one place —
+a log line ([Handlers_Social.cpp:2895](X2Lib/Offline/Handlers_Social.cpp#L2895)).
+Live, `EGS_OPEN_RANDOM_ITEM_REQ` fills `m_setSealRandomItem`
+([GSUserInventory.cpp:2183-2196](KncWX2Server/GameServer/GSUserInventory.cpp#L2183))
+from `IsSealRandomItemCube( cubeID )` ∧ `IsCanSealForRandomItem( resultID )`,
+and the DB layer applies `m_ucSealData = 100`
+([GSGameDBThread.cpp:3381](KncWX2Server/GameServer/GSGameDBThread.cpp#L3381)).
+
+**The two interact.** `Query_UpdateSealItem` skips any item with a period:
+`if( mit->second.m_sPeriod > 0 ) continue;`
+([GSGameDBThread.cpp:3377](KncWX2Server/GameServer/GSGameDBThread.cpp#L3377)).
+A rental reward is never sealed. Implement period first, then let the seal
+respect it — doing them in the other order hides the interaction.
+
+**The reference for the insert half is `KInventory::OpenRandomItem`**
+([Inventory.cpp:8455](KncWX2Server/GameServer/Inventory.cpp#L8455) / `:8470`,
+called from [GSUserInventory.cpp:1859](KncWX2Server/GameServer/GSUserInventory.cpp#L1859)).
+`CX2OfflineRandomItem` ported only the *draw* half
+(`CXSLRandomItemManager::GetResultItem`), which is why these two fields have no
+home yet.
+
+`SERV_TREASURE_BOX_ITEM` is **off** (§0.3), so the `IsTreasureBox` arm of the
+seal condition at `:2189` does not compile in — do not port it.
+
+### What to do
+1. Give `InsertItem` an optional `iPeriod` (default 0) and thread
+   `KResult::m_iPeriod` through from `Handlers_Social.cpp:2843`. Audit the other
+   `InsertItem` callers before changing the signature — they all pass positional
+   arguments.
+2. Set `m_iUsageType` consistently with the period. A timed item is
+   `CX2Item::PT_*` — read what `MakeInventoryItemInfo` expects
+   ([X2OfflineInventory.cpp:636](X2Lib/Offline/X2OfflineInventory.cpp#L636))
+   rather than guessing, or the client will draw the wrong tooltip.
+3. Apply the seal: for a cube where `IsSealedCube( cubeID )` is true, set
+   `m_iSealData = 100` on each inserted row whose item ID is sealable — **and
+   only when that row's period is 0**, per `:3377`.
+4. `CX2OfflineRandomItem` needs the `IsCanSealForRandomItem( resultID )` half of
+   the condition; `RandomItemData.lua`'s `AddSealRandomItemInfo` is where it
+   comes from. If that data turns out to be cube-level only, say so and seal at
+   cube granularity — do not approximate silently.
+5. Ask for `gup_insert_item` and `gup_update_item_seal` (§1) to confirm the
+   column semantics before committing. This is the one phase where the live DB
+   genuinely settles something.
+
+### Trap
+- **Do not land this before phase 39.** A sealed reward with no unseal path is a
+  dead item in a player's bag, and `els_db.sql` is real data.
+- `InsertItem`'s third argument is enchant level. Adding a period as a fourth
+  positional argument next to the optional `pvecSocket` is easy to get wrong —
+  check every call site compiles *and* still means what it did.
+- Phase 39's `m_iSealData` arithmetic applies here too: set 100, never 1.
+
+### Exit test
+Open a cube known to pay a timed item: the item shows its remaining days in the
+tooltip and `select period, usage_type from item …` is non-zero. Open a sealed
+cube: the reward carries the bound marker, `seal_data = 100`, and phase 39's
+unseal then clears it. A cube paying a **timed** reward out of a **sealed** cube
+leaves that row with `seal_data = 0` — the `:3377` rule.
+
+---
+
+# Phase 41 — `EGS_ITEM_EXCHANGE_REQ`
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+### Symptom
+The exchange NPC's confirm button does nothing; the packet is declined
+([X2OfflineIgnore.cpp:68](X2Lib/Offline/X2OfflineIgnore.cpp#L68)).
+
+### Diagnosis — CONFIRMED
+Live entry point: [`EGS_ITEM_EXCHANGE_REQ` at GSUserInventory.cpp:6949](KncWX2Server/GameServer/GSUserInventory.cpp#L6949),
+with the DB round trip at [`DBE_ITEM_EXCHANGE_ACK`, `:7278`](KncWX2Server/GameServer/GSUserInventory.cpp#L7278)
+and a limit check at `:8085`. The logic is in `KInventory`, which has a
+**check** function and four `ItemExchange` overloads — read them before picking
+one:
+
+| function | line |
+|---|---|
+| `ItemExchangeCheck( iHouseID, … )` | [Inventory.cpp:15275](KncWX2Server/GameServer/Inventory.cpp#L15275) |
+| `ItemExchange( iHouseID, … )` ×3 | `:15473`, `:15746`, `:15764` |
+| `ItemExchange( iItemID, iHouseID, iSelectedItemID, mapInsertedItem, vecUpdated, vecNewItem )` | [`:15985`](KncWX2Server/GameServer/Inventory.cpp#L15985) |
+
+The `iSelectedItemID` parameter on the last one is the tell: **this is the
+"choose one of N" box**, which is a distinct shape from the cube's random draw
+and from a fixed bundle.
+
+The data is client-side: `ItemExchangeTable.lua` →
+`g_pItemManager:AddItemExchangeData`, carrying at least `m_iSourceQuantity` and
+`m_iServerGroupID` (§0.4). `CX2ItemManager` already parses it, so the offline
+server can read the client's own parsed table rather than re-loading the file —
+check `X2ItemManager.h` for the accessor before writing a loader.
+
+### What to do
+1. Establish which overload the US build's call site actually reaches, by
+   reading `:6949` under the §0.3 flag states. Do not port all four.
+2. Prefer reading `CX2ItemManager`'s already-parsed exchange data over adding a
+   second loader; fall back to the `CX2OfflineRandomItem::RunScript` shape only
+   if there is no accessor.
+3. Implement: validate the source items and quantity, validate the selection is
+   in the group, consume, insert, reply with every touched slot. Fill `m_iED` if
+   the ACK carries one, and take the commission if the table has one.
+4. Remove the ignore entry.
+
+### Trap
+- `m_iServerGroupID` gates rows by server. Offline there is one server; read
+  what the client passes rather than assuming 0.
+- The "choose one of N" shape means the request names a **selection**. Validating
+  that the selection belongs to the group is the whole security of the feature —
+  offline it is the whole correctness of it.
+
+### Exit test
+Exchange at the NPC: source items leave the bag, the chosen reward arrives, ED
+moves by the commission, everything updates without a character re-select. A
+selection that is not in the group is refused with the source items intact.
+
+---
+
+# Phase 42 — `EGS_ITEM_CONVERT_REQ`
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+### Symptom
+Conversion does nothing; the packet is declined
+([X2OfflineIgnore.cpp:67](X2Lib/Offline/X2OfflineIgnore.cpp#L67)).
+
+### Diagnosis — CONFIRMED
+Live: [`EGS_ITEM_CONVERT_REQ` at GSUserInventory.cpp:9064](KncWX2Server/GameServer/GSUserInventory.cpp#L9064),
+DB round trip at [`DBE_ITEM_CONVERT_ACK`, `:9126`](KncWX2Server/GameServer/GSUserInventory.cpp#L9126).
+
+Data is client-side: `ItemConvertTable.lua` →
+`g_pItemManager:AddItemConvertInfo` / `AddItemConvertGroup`, with fields
+`m_ConvertType`, `m_TargetItemID`, `m_ResultItemID`, `m_Commission` (§0.4).
+`m_ConvertType` implies more than one conversion mode — enumerate the distinct
+values in the decrypted table before writing the switch, rather than assuming
+one.
+
+### What to do
+1. Read `:9064` and `:9126` together; the effect is likely in the DB ACK.
+2. Enumerate `m_ConvertType`'s distinct values from the table, and implement each
+   the server implements. Refuse any type you do not implement, item intact,
+   with the type in the log.
+3. Charge `m_Commission` and fill `m_iED` on the ACK from the loaded row (rule 2).
+4. Remove the ignore entry.
+
+### Trap
+Convert and exchange look alike and are different tables with different packets.
+Do not share an implementation between phases 41 and 42 before reading both
+live handlers — a shared helper that fits one and is bent to fit the other is
+how the wire format drifts.
+
+### Exit test
+Convert an item: the target leaves, the result arrives, ED drops by the
+commission, `select … from item` agrees with the UI without a re-select.
+
+---
+
+# Phase 43 — Dungeon reward box: confirm it is dead, then decide
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+### Symptom
+The end-of-dungeon treasure-box pick never appears. The offline handlers are
+phase-3 stubs whose comments say the feature is waiting on inventory work that
+has since landed ([Handlers_Room.cpp:3228-3249](X2Lib/Offline/Handlers_Room.cpp#L3228)).
+
+### Diagnosis — CONFIRMED, and it is not what the stubs assume
+
+**The live server has no handler for these packets at all.** Searching the whole
+of `KncWX2Server/` for `REWARD_BOX` returns only:
+
+- the six event IDs ([EventID_Client.h:297-303](KncWX2Server/Common/EventID_Client.h#L297)),
+- their serializers ([ClientPacket.cpp:2459-2492](KncWX2Server/Common/ClientPacket.cpp#L2459)),
+- an unrelated UI enum, `NUI_MI_REWARD_BOX`.
+
+No `IMPL_ON_FUNC` for `EGS_START_REWARD_BOX_SELECT_REQ` or
+`EGS_SELECT_REWARD_BOX_REQ` exists in any of the five servers. So the live US
+server never sent `EGS_START_REWARD_BOX_SELECT_NOT` either.
+
+The client sends the request unconditionally from the result screen
+([X2StateDungeonResult.cpp:950-954](X2Lib/X2StateDungeonResult.cpp#L950)) and
+only advances to the box-pick animation when
+`Handler_EGS_START_REWARD_BOX_SELECT_NOT` sets `m_bStartRewardBoxSelectNot`
+([`:2021-2026`](X2Lib/X2StateDungeonResult.cpp#L2021)). No `_NOT`, no box —
+on live and offline alike.
+
+**So offline's stub reproduces live behaviour exactly**, and the phase-3 comment
+("nothing in the boxes until item drops land in phase 5") is a stale guess, not
+a finding.
+
+### What to do
+1. **Re-verify the negative** before acting on it — a grep proving absence is
+   weaker than one proving presence. Check the CenterServer and GlobalServer FSM
+   registration tables as well as `IMPL_ON_FUNC`, and check whether any
+   `SERV_*` flag would compile a handler in for another region.
+2. If it holds: **change nothing in the handlers.** Replace the stale phase-3
+   comments with the finding and its references, correct the claim in
+   `OFFLINE_MODE_PLAN.md` if it repeats there, and record it in this document.
+   A feature that is off *and matches live* is finished.
+3. If a handler does turn up somewhere, this becomes a real implementation phase
+   and the box contents come from that handler's table — reopen it then.
+
+### Trap
+The temptation is to build the box because it is called a box and the stubs
+invite it. Building it would make offline **diverge** from live in the player's
+favour, inventing a reward source the real game did not have. That is the
+band-aid this project's rules name, wearing a feature's clothes.
+
+### Exit test
+A written answer with references: the feature is dead on live, the stub is
+correct, here is where that is proven. Plus one dungeon run confirming the
+result screen completes normally and neither event ID appears in the
+`UNHANDLED` bucket.
+
+---
+
+# Phase 44 — `EGS_ITEM_MANUFACTURE_REQ`: the item workshop
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+### Symptom
+The workshop's craft button does nothing; the packet is declined
+([X2OfflineIgnore.cpp:60](X2Lib/Offline/X2OfflineIgnore.cpp#L60)).
+
+### Diagnosis — CONFIRMED
+Live: [`EGS_ITEM_MANUFACTURE_REQ` at GSUserInventory.cpp:2681](KncWX2Server/GameServer/GSUserInventory.cpp#L2681),
+DB round trip at [`DBE_ITEM_MANUFACTURE_ACK`, `:2813`](KncWX2Server/GameServer/GSUserInventory.cpp#L2813).
+The DB thread inserts with `SEnum::GIR_MANUFACTURE`
+([GSGameDBThread.cpp:9896](KncWX2Server/GameServer/GSGameDBThread.cpp#L9896)) —
+the same `Query_InsertItemList` the cube uses, so phase 40's period/seal work
+applies here too if it landed first.
+
+Recipes are client-side: `ManufactureItem.lua`, parsed into
+`CX2ItemManager::ManufactureData` (`m_ManufactureType`, `m_ResultGroupID`, and a
+`MaterialData` list of `m_MaterialItemID` / `m_MaterialCount`,
+[X2ItemManager.h:63-75](X2Lib/X2ItemManager.h#L63)).
+
+### What to do
+1. Read `:2681` and `:2813`; the material consumption and the result insert are
+   split across them.
+2. Read the recipe out of `CX2ItemManager`'s parsed table rather than adding a
+   loader, if an accessor exists.
+3. Implement: validate materials and ED cost, consume, insert the result, reply
+   with every touched slot and the real ED. `m_ResultGroupID` suggests the result
+   may itself be a group draw — check whether it routes through
+   `CXSLRandomItemManager`, and if so reuse `CX2OfflineRandomItem` rather than
+   writing a second draw.
+4. Remove the ignore entry.
+
+### Trap
+If the result is a group draw, the odds live in `RandomItemTable.lua` and the
+existing draw code already implements `m_bGiveAll` and the class conditions.
+Writing a second, simpler draw beside it is how the two start disagreeing.
+
+### Exit test
+Craft a recipe the save has materials for: materials leave, the result arrives,
+ED drops by the cost. A recipe with missing materials is refused with everything
+intact.
+
+---
+
+# Phase 45 — `EGS_SYNTHESIS_ITEM_REQ`, and an empty `UNHANDLED` bucket
+
+**Flag:** `SERV_IRUHADEV_OFFLINE`
+
+### Symptom
+Synthesis is neither handled nor ignored, so it logs `*** UNHANDLED ***` — the
+one bucket this project keeps empty on purpose, because any line in it is
+supposed to be new information.
+
+### Diagnosis — CONFIRMED
+Live: [`EGS_SYNTHESIS_SOCKET_GROUPID_REQ` at GSUserInventory.cpp:8259](KncWX2Server/GameServer/GSUserInventory.cpp#L8259)
+(no param), [`EGS_SYNTHESIS_ITEM_REQ` at `:8276`](KncWX2Server/GameServer/GSUserInventory.cpp#L8276),
+and [`DBE_OPEN_SYNTHESIS_ITEM_ACK` at `:8358`](KncWX2Server/GameServer/GSUserInventory.cpp#L8358).
+The `OPEN_` in the DB ACK's name says this is another draw-shaped feature, and
+`SocketItemTable.lua` is in `data036/`.
+
+### What to do
+1. Read the three handlers. Decide honestly between implementing and ignoring —
+   if the socket-synthesis system has no other offline support, an `IGNORED`
+   entry with a real reason is a legitimate finished outcome.
+2. Either way, the packet must leave the `UNHANDLED` bucket: add a handler, or
+   add an `X2OfflineIgnore.cpp` entry naming what is missing.
+3. **Close the batch.** Run a long session exercising every phase in 36-44, then:
+   ```sh
+   grep -E "UNHANDLED|EXCEPTION" offline_packets.log | sort | uniq -c | sort -rn
+   grep "CENSUS" offline_server.log
+   ```
+   Every remaining declined ID should have a reason in `X2OfflineIgnore.cpp`.
+4. Update `ISSUES_2.md` #7 and `MODS.md` with what landed and how to revert it.
+
+### Trap
+An `IGNORED` entry is a promise that nothing is silently dropped. Do not use it
+to make a symptom go away — phase 38's stale `EGS_RESOLVE_ITEM_REQ` line is what
+that looks like a year later.
+
+### Exit test
+`grep UNHANDLED offline_packets.log` is empty after a session that opened cubes,
+used bag items, sealed and unsealed, exchanged, converted, crafted and cleared a
+dungeon. The clean-exit census names every declined ID with a reason.
